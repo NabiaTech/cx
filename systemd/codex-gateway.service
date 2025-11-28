@@ -1,0 +1,23 @@
+# Example systemd unit for Codex Gateway
+# Copy to: /etc/systemd/system/codex-gateway.service (edit paths/user)
+# Then: sudo systemctl daemon-reload && sudo systemctl enable --now codex-gateway
+
+[Unit]
+Description=Codex Local Ingest Gateway
+After=network.target
+
+[Service]
+# Adjust User= to your account (e.g., pi)
+User=pi
+Group=pi
+
+# Edit ExecStart path to where scripts are located
+ExecStart=/usr/bin/python3 /home/pi/scripts/infrastructure/codex-gateway.py --host 0.0.0.0 --port 8080
+WorkingDirectory=/home/pi/scripts
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

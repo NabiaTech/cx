@@ -1,0 +1,553 @@
+#!/bin/bash
+# cx - Codex Suite CLI
+# Unified wrapper for OpenAI Codex with logging, analytics, headless mode, and session management
+#
+# Usage: cx <command> [options]
+#
+# Commands:
+#   (default)   Run codex with structured logging (alias for 'tee')
+#   tee         Run codex with structured JSONL logging
+#   log         Run codex with simple TTY logging
+#   resume      Resume a previous session (with logging)
+#   headless    Run codex in headless mode (non-interactive)
+#   sessions    List/manage logged sessions
+#   ship        Ship logs to Loki/HTTP endpoint
+#   rollup      Generate usage reports
+#   analyze     Quick analysis of recent sessions
+#   cleanup     Prune old logs
+#   gateway     Run local HTTP ingest server
+#   tail-shipper Follow logs and ship to endpoint
+#   setup       Configure federation and aliases
+#   status      Show suite status
+#
+# Examples:
+#   cx                           # Interactive codex with logging
+#   cx -m gpt-4o                # Specify model
+#   cx resume                    # Resume last session (picker)
+#   cx resume --last             # Resume most recent session
+#   cx headless "fix the bug"    # Non-interactive execution
+#   cx sessions                  # List recent sessions
+#   cx analyze --today           # Today's usage report
+
+set -euo pipefail
+
+# Resolve installation directory (handles symlinks)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+
+CODEX_LOGS_DIR="${CODEX_LOGS_DIR:-$HOME/.codexlogs}"
+CODEX_SESSIONS_DIR="${CODEX_SESSIONS_DIR:-$HOME/.codex}"
+
+show_usage() {
+    cat << 'EOF'
+cx - Codex Suite CLI
+====================
+
+Usage: cx [command] [options]
+
+Session Commands:
+  (no command)      Run codex interactively with structured logging
+  tee               Run codex with structured JSONL logging (same as default)
+  log               Run codex with simple TTY capture logging
+  resume [opts]     Resume a previous codex session
+                    --last    Resume most recent session
+                    --pick    Show session picker (default)
+  headless <prompt> Run codex non-interactively with a prompt
+                    -m MODEL  Specify model (e.g., gpt-4o, o1)
+                    --quiet   Suppress progress output
+
+Session Management:
+  sessions          List recent logged sessions
+                    --today   Show only today's sessions
+                    --json    Output as JSON
+
+Analytics & Shipping:
+  rollup [date]     Generate usage reports (YYYY-MM-DD or --days N)
+  analyze           Quick analysis (--today, --yesterday, --last-week)
+  ship <file>       Ship JSONL to Loki
+  ship-generic      Ship to generic HTTP endpoint
+  cleanup           Prune old logs (--days 90 default, --days -1 to retain all)
+
+Infrastructure:
+  gateway           Run local HTTP ingest server (--port 8080)
+  tail-shipper      Continuously follow and ship logs to endpoint
+
+Setup:
+  setup             Configure federation, create aliases
+  status            Show suite status and health
+
+Examples:
+  cx                              # Start interactive session with logging
+  cx -m o1                        # Use o1 model
+  cx resume --last                # Resume most recent session
+  cx headless "explain main.py"   # One-shot headless execution
+  cx sessions --today             # List today's sessions
+  cx analyze --last-week          # Weekly usage report
+
+Environment:
+  CODEX_LOGS_DIR    Log storage (default: ~/.codexlogs)
+  LOKI_URL          Loki endpoint for shipping (default: http://localhost:3100)
+EOF
+}
+
+ensure_directories() {
+    mkdir -p "$CODEX_LOGS_DIR"
+    mkdir -p "${HOME}/.memchain" 2>/dev/null || true
+}
+
+# ============================================================================
+# Session Commands
+# ============================================================================
+
+cmd_tee() {
+    # Use v2 if available (better terminal handling), fallback to v1
+    if [[ -x "${LIB_DIR}/codex-tee-v2.py" ]]; then
+        exec python3 "${LIB_DIR}/codex-tee-v2.py" "$@"
+    elif [[ -x "${LIB_DIR}/codex-tee.py" ]]; then
+        exec python3 "${LIB_DIR}/codex-tee.py" "$@"
+    else
+        echo "Error: No tee logger found in $LIB_DIR" >&2
+        exit 1
+    fi
+}
+
+cmd_log() {
+    if [[ -x "${LIB_DIR}/codex-log" ]]; then
+        exec "${LIB_DIR}/codex-log" "$@"
+    else
+        echo "Error: codex-log not found in $LIB_DIR" >&2
+        exit 1
+    fi
+}
+
+cmd_resume() {
+    local resume_args=()
+    local codex_args=()
+    local use_last=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --last)
+                use_last=true
+                shift
+                ;;
+            --pick)
+                # Default behavior
+                shift
+                ;;
+            -m|--model)
+                codex_args+=("$1" "$2")
+                shift 2
+                ;;
+            --help|-h)
+                echo "Usage: cx resume [options]"
+                echo ""
+                echo "Options:"
+                echo "  --last    Resume the most recent session"
+                echo "  --pick    Show session picker (default)"
+                echo "  -m MODEL  Specify model for resumed session"
+                exit 0
+                ;;
+            *)
+                codex_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if $use_last; then
+        resume_args+=("--last")
+    fi
+
+    # Run codex resume through tee logger for continued logging
+    cmd_tee resume "${resume_args[@]}" "${codex_args[@]}"
+}
+
+cmd_headless() {
+    local model=""
+    local quiet=false
+    local prompt=""
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -m|--model)
+                model="$2"
+                shift 2
+                ;;
+            --quiet|-q)
+                quiet=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: cx headless <prompt> [options]"
+                echo ""
+                echo "Run codex non-interactively with a prompt."
+                echo ""
+                echo "Options:"
+                echo "  -m MODEL   Specify model (e.g., gpt-4o, o1)"
+                echo "  --quiet    Suppress progress output"
+                echo ""
+                echo "Examples:"
+                echo "  cx headless 'explain this codebase'"
+                echo "  cx headless -m o1 'refactor main.py for performance'"
+                exit 0
+                ;;
+            -*)
+                extra_args+=("$1")
+                shift
+                ;;
+            *)
+                if [[ -z "$prompt" ]]; then
+                    prompt="$1"
+                else
+                    extra_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$prompt" ]]; then
+        echo "Error: prompt required for headless mode" >&2
+        echo "Usage: cx headless <prompt> [-m model]" >&2
+        exit 1
+    fi
+
+    local codex_args=()
+    [[ -n "$model" ]] && codex_args+=("-m" "$model")
+    $quiet && codex_args+=("--quiet")
+    codex_args+=("${extra_args[@]}")
+    codex_args+=("$prompt")
+
+    # Run through tee for logging
+    cmd_tee "${codex_args[@]}"
+}
+
+cmd_sessions() {
+    local filter="all"
+    local format="text"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --today)
+                filter="today"
+                shift
+                ;;
+            --json)
+                format="json"
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: cx sessions [options]"
+                echo ""
+                echo "Options:"
+                echo "  --today   Show only today's sessions"
+                echo "  --json    Output as JSON"
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ "$format" == "json" ]]; then
+        # Output JSON list of sessions
+        find "$CODEX_LOGS_DIR" -name "*.meta.json" -type f | while read -r f; do
+            cat "$f"
+        done | jq -s '.'
+    else
+        echo "Recent Codex Sessions"
+        echo "====================="
+        echo ""
+
+        local find_args=("$CODEX_LOGS_DIR" "-name" "*.jsonl" "-type" "f")
+        if [[ "$filter" == "today" ]]; then
+            find_args+=("-newermt" "$(date +%Y-%m-%d)")
+        fi
+
+        find "${find_args[@]}" -printf "%T@ %p\n" 2>/dev/null | \
+            sort -rn | head -20 | while read -r ts path; do
+            local basename=$(basename "$path" .jsonl)
+            local dir=$(dirname "$path")
+            local meta="${dir}/${basename}.meta.json"
+            local date_part=$(echo "$basename" | grep -oP '\d{8}-\d{6}' | head -1)
+
+            if [[ -f "$meta" ]]; then
+                local model=$(jq -r '.model // "unknown"' "$meta" 2>/dev/null)
+                local duration=$(jq -r '.duration_seconds // 0' "$meta" 2>/dev/null)
+                printf "  %s  model:%-12s  %ds\n" "$date_part" "$model" "$duration"
+            else
+                printf "  %s\n" "$date_part"
+            fi
+        done
+
+        local total=$(find "$CODEX_LOGS_DIR" -name "*.jsonl" | wc -l)
+        echo ""
+        echo "Total sessions: $total"
+    fi
+}
+
+# ============================================================================
+# Analytics Commands
+# ============================================================================
+
+cmd_rollup() {
+    exec python3 "${LIB_DIR}/codex-daily-rollup.py" "$@"
+}
+
+cmd_analyze() {
+    local timeframe="today"
+    local format="markdown"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --today)     timeframe="today"; shift ;;
+            --yesterday) timeframe="yesterday"; shift ;;
+            --last-week) timeframe="week"; shift ;;
+            --json)      format="json"; shift ;;
+            --help|-h)
+                echo "Usage: cx analyze [options]"
+                echo ""
+                echo "Options:"
+                echo "  --today      Analyze today's sessions (default)"
+                echo "  --yesterday  Analyze yesterday's sessions"
+                echo "  --last-week  Analyze last 7 days"
+                echo "  --json       Output in JSON format"
+                exit 0
+                ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    case $timeframe in
+        today)
+            cmd_rollup "$(date +%Y-%m-%d)" --format="$format"
+            ;;
+        yesterday)
+            # macOS compatible date handling
+            if date -v-1d >/dev/null 2>&1; then
+                cmd_rollup "$(date -v-1d +%Y-%m-%d)" --format="$format"
+            else
+                cmd_rollup "$(date -d yesterday +%Y-%m-%d)" --format="$format"
+            fi
+            ;;
+        week)
+            cmd_rollup --days 7 --format="$format"
+            ;;
+    esac
+}
+
+# ============================================================================
+# Shipping Commands
+# ============================================================================
+
+cmd_ship() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: cx ship <jsonl-file> [options]"
+        echo "Ship JSONL session logs to Loki federation"
+        exit 1
+    fi
+    exec python3 "${LIB_DIR}/codex-loki-shipper.py" "$@"
+}
+
+cmd_ship_generic() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: cx ship-generic <jsonl-file> --endpoint <URL> [options]"
+        exit 1
+    fi
+    exec python3 "${LIB_DIR}/codex-generic-shipper.py" "$@"
+}
+
+cmd_cleanup() {
+    exec python3 "${LIB_DIR}/codex-log-cleanup.py" "$@"
+}
+
+# ============================================================================
+# Infrastructure Commands
+# ============================================================================
+
+cmd_gateway() {
+    exec python3 "${LIB_DIR}/codex-gateway.py" "$@"
+}
+
+cmd_tail_shipper() {
+    exec python3 "${LIB_DIR}/codex-tail-shipper.py" "$@"
+}
+
+# ============================================================================
+# Setup & Status
+# ============================================================================
+
+cmd_setup() {
+    echo "Setting up Codex Suite..."
+    echo ""
+
+    mkdir -p "${HOME}/.memchain"
+
+    # Check for Loki
+    local loki_url="${LOKI_URL:-http://localhost:3100}"
+    echo "Checking Loki at $loki_url..."
+    if curl -s "$loki_url/ready" >/dev/null 2>&1; then
+        echo "✓ Loki is available"
+    else
+        echo "⚠ Loki not available (optional for local-only use)"
+    fi
+
+    # Create federation config
+    local fed_config="${HOME}/.memchain/loki.json"
+    if [[ ! -f "$fed_config" ]]; then
+        cat > "$fed_config" << EOF
+{
+  "codex": {
+    "loki_url": "$loki_url",
+    "job_name": "codex-sessions",
+    "federation_node": "codex-$(hostname)"
+  }
+}
+EOF
+        echo "✓ Created federation config"
+    fi
+
+    # Create aliases
+    local alias_file="${HOME}/.codex_aliases"
+    local cx_path="$SCRIPT_DIR/cx"
+    cat > "$alias_file" << EOF
+# Codex Suite Aliases
+# Source this in your shell config: source ~/.codex_aliases
+
+# Main commands (use full path for reliability)
+alias cx='$cx_path'
+alias cx-resume='$cx_path resume'
+alias cx-headless='$cx_path headless'
+
+# Analytics
+alias cx-sessions='$cx_path sessions'
+alias cx-rollup='$cx_path rollup'
+alias cx-analyze='$cx_path analyze'
+alias cx-status='$cx_path status'
+
+# Quick shortcuts
+alias cx-today='$cx_path analyze --today'
+alias cx-yesterday='$cx_path analyze --yesterday'
+alias cx-week='$cx_path analyze --last-week'
+EOF
+
+    echo "✓ Created aliases at $alias_file"
+    echo ""
+    echo "To finish setup, add to your shell config:"
+    echo "  echo 'source ~/.codex_aliases' >> ~/.zshrc"
+    echo "  source ~/.codex_aliases"
+    echo ""
+    echo "Or add $SCRIPT_DIR to your PATH"
+}
+
+cmd_status() {
+    echo "Codex Suite Status"
+    echo "=================="
+    echo ""
+    echo "Installation: $SCRIPT_DIR"
+    echo "Library:      $LIB_DIR"
+    echo ""
+
+    if [[ -d "$CODEX_LOGS_DIR" ]]; then
+        local total=$(find "$CODEX_LOGS_DIR" -name "*.jsonl" 2>/dev/null | wc -l)
+        local size=$(du -sh "$CODEX_LOGS_DIR" 2>/dev/null | cut -f1)
+        local today=$(find "$CODEX_LOGS_DIR" -name "*.jsonl" -newermt "$(date +%Y-%m-%d)" 2>/dev/null | wc -l)
+        echo "Logs: $CODEX_LOGS_DIR"
+        echo "  Total sessions: $total"
+        echo "  Total size: $size"
+        echo "  Today: $today sessions"
+    else
+        echo "Logs: Not initialized (will create on first run)"
+    fi
+
+    echo ""
+    echo "Components:"
+    echo "  $(command -v codex >/dev/null && echo "✓" || echo "✗") codex CLI"
+    echo "  $([[ -f "${LIB_DIR}/codex-tee-v2.py" ]] && echo "✓" || echo "✗") tee logger (v2)"
+    echo "  $([[ -f "${LIB_DIR}/codex-log" ]] && echo "✓" || echo "✗") simple logger"
+    echo "  $([[ -f "${LIB_DIR}/codex-daily-rollup.py" ]] && echo "✓" || echo "✗") rollup analytics"
+    echo "  $([[ -f "${LIB_DIR}/codex-loki-shipper.py" ]] && echo "✓" || echo "✗") loki shipper"
+    echo "  $([[ -f "${LIB_DIR}/codex-gateway.py" ]] && echo "✓" || echo "✗") local gateway"
+    echo "  $([[ -f "${LIB_DIR}/codex-tail-shipper.py" ]] && echo "✓" || echo "✗") tail shipper"
+    echo "  $([[ -f "${LIB_DIR}/codex-log-cleanup.py" ]] && echo "✓" || echo "✗") cleanup"
+
+    echo ""
+    echo "Dependencies:"
+    echo "  $(command -v python3 >/dev/null && echo "✓" || echo "✗") python3"
+    echo "  $(python3 -c "import requests" 2>/dev/null && echo "✓" || echo "⚠") requests (for shipping)"
+    echo "  $(command -v jq >/dev/null && echo "✓" || echo "⚠") jq (optional)"
+}
+
+# ============================================================================
+# Main Dispatch
+# ============================================================================
+
+ensure_directories
+
+# No args = interactive tee session
+if [[ $# -eq 0 ]]; then
+    cmd_tee
+    exit $?
+fi
+
+command="$1"
+
+# Handle help before anything else
+if [[ "$command" == "help" || "$command" == "--help" || "$command" == "-h" ]]; then
+    show_usage
+    exit 0
+fi
+
+# Check if first arg looks like a codex option (starts with -)
+# If so, pass everything to tee
+if [[ "$command" == -* ]]; then
+    cmd_tee "$@"
+    exit $?
+fi
+
+shift
+
+case "$command" in
+    # Session commands
+    tee)          cmd_tee "$@" ;;
+    log)          cmd_log "$@" ;;
+    resume)       cmd_resume "$@" ;;
+    headless)     cmd_headless "$@" ;;
+    sessions)     cmd_sessions "$@" ;;
+
+    # Analytics
+    rollup)       cmd_rollup "$@" ;;
+    analyze)      cmd_analyze "$@" ;;
+
+    # Shipping
+    ship)         cmd_ship "$@" ;;
+    ship-generic) cmd_ship_generic "$@" ;;
+    cleanup)      cmd_cleanup "$@" ;;
+
+    # Infrastructure
+    gateway)      cmd_gateway "$@" ;;
+    tail-shipper) cmd_tail_shipper "$@" ;;
+
+    # Setup
+    setup)        cmd_setup "$@" ;;
+    status)       cmd_status "$@" ;;
+
+    help|--help|-h)
+        show_usage
+        ;;
+
+    *)
+        # Unknown command - assume it's a codex arg, pass to tee
+        cmd_tee "$command" "$@"
+        ;;
+esac

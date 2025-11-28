@@ -1,0 +1,23 @@
+# Example systemd unit for Codex Tail Shipper
+# Copy to: /etc/systemd/system/codex-tail-shipper.service (edit paths/user)
+# Then: sudo systemctl daemon-reload && sudo systemctl enable --now codex-tail-shipper
+
+[Unit]
+Description=Codex Tail Shipper (generic HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+Group=pi
+Environment=PYTHONUNBUFFERED=1
+# Replace endpoint and paths as needed
+ExecStart=/usr/bin/python3 /home/pi/scripts/infrastructure/codex-tail-shipper.py \
+  --endpoint http://127.0.0.1:8080/ingest --base /home/pi/.codexlogs --interval 2.0
+WorkingDirectory=/home/pi/scripts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+

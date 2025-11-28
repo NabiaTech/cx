@@ -1,0 +1,70 @@
+#!/bin/bash
+# Codex Session Logger - Simple script-based approach
+# Usage: codex-log [codex-args...]
+# Logs full TTY sessions to organized directory structure
+
+set -euo pipefail
+
+# Configuration
+LOGDIR="${HOME}/.codexlogs/$(date +%Y/%m/%d)"
+LOGFILE="${LOGDIR}/codex-$(date +%Y%m%d-%H%M%S).ttylog"
+METAFILE="${LOGFILE%.ttylog}.meta.json"
+
+# Ensure log directory exists
+mkdir -p "$LOGDIR"
+
+# Create metadata file
+cat > "$METAFILE" << EOF
+{
+  "session_id": "$(basename "${LOGFILE%.ttylog}")",
+  "started_at": "$(date -Iseconds)",
+  "cmd": ["codex", $(printf '"%s",' "$@" | sed 's/,$//')],
+  "cwd": "$(pwd)",
+  "hostname": "$(hostname)",
+  "user": "$USER",
+  "codex_version": "$(codex --version 2>/dev/null || echo 'unknown')",
+  "env": {
+    "SHELL": "${SHELL:-unknown}",
+    "TERM": "${TERM:-unknown}",
+    "LANG": "${LANG:-unknown}"
+  },
+  "version": 1
+}
+EOF
+
+echo "Starting logged Codex session..."
+echo "Session ID: $(basename "${LOGFILE%.ttylog}")"
+echo "Log file: $LOGFILE"
+echo "Meta file: $METAFILE"
+echo "----------------------------------------"
+
+# Run codex with script logging (quiet, flush immediately)
+script -q -f -c "codex $*" "$LOGFILE"
+
+# Update metadata with end time and file size using Python
+python3 -c "
+import json
+import os
+import datetime
+
+metafile = '$METAFILE'
+logfile = '$LOGFILE'
+
+with open(metafile, 'r') as f:
+    data = json.load(f)
+
+data['ended_at'] = datetime.datetime.now().isoformat()
+try:
+    data['log_size_bytes'] = os.path.getsize(logfile)
+except:
+    data['log_size_bytes'] = 0
+
+with open(metafile, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+
+echo "----------------------------------------"
+echo "Session completed and saved:"
+echo "  Log: $LOGFILE"
+echo "  Meta: $METAFILE"
+echo "  Size: $(ls -lh "$LOGFILE" | awk '{print $5}') ($(stat -c%s "$LOGFILE") bytes)"
