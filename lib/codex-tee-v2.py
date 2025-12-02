@@ -27,10 +27,42 @@ from typing import Dict, Any, Optional, Tuple
 FEDERATION_ENABLED = os.environ.get("CX_FEDERATION_EVENTS", "1") == "1"
 LOKI_SHIP_ENABLED = os.environ.get("CX_LOKI_SHIP", "0") == "1"  # Auto-ship on session end
 
+# Regex pattern for Codex native UUID (UUIDv7 format: 019adb8e-f58d-7c02-ac81-091803b2fe90)
+import re
+CODEX_UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
 def now_iso() -> str:
     """Generate current timestamp in ISO format with milliseconds"""
     t = time.time()
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)) + f".{int((t%1)*1000):03d}"
+
+
+def extract_codex_uuid(args: list[str]) -> Optional[str]:
+    """
+    Extract Codex native session UUID from command arguments.
+
+    Codex uses UUIDv7 for session IDs (e.g., 019adb8e-f58d-7c02-ac81-091803b2fe90).
+    This allows correlating cx sessions with Codex's internal session continuity,
+    especially important for resumed sessions.
+
+    Returns the UUID if found in args, None otherwise.
+    """
+    for arg in args:
+        if CODEX_UUID_PATTERN.match(arg):
+            return arg
+    return None
+
+
+def detect_resume_mode(args: list[str]) -> Tuple[bool, Optional[str]]:
+    """
+    Detect if this is a resume operation and extract the Codex UUID if present.
+
+    Returns:
+        (is_resume, codex_uuid) tuple
+    """
+    is_resume = "resume" in args
+    codex_uuid = extract_codex_uuid(args) if is_resume else None
+    return is_resume, codex_uuid
 
 def ensure_log_paths() -> Tuple[str, pathlib.Path, pathlib.Path, pathlib.Path]:
     """Create organized log directory structure and return file paths"""
@@ -222,48 +254,76 @@ def main():
     if shutil.which("codex") is None:
         print("error: 'codex' not found on PATH", file=sys.stderr)
         sys.exit(127)
-    
+
+    # Detect resume mode and extract Codex native UUID for correlation
+    is_resume, codex_uuid = detect_resume_mode(sys.argv[1:])
+
     # Set up logging paths
     session_id, raw_path, jsonl_path, meta_path = ensure_log_paths()
-    
+
     # Keep metadata lean - only essential environment variables
     env_keep = ["SHELL", "TERM", "LANG", "LC_ALL", "PATH", "HOME"]
     env_snapshot = {k: os.environ.get(k, "") for k in env_keep if k in os.environ}
-    
+
     # Write session metadata
     meta = write_meta(meta_path, ["codex"] + sys.argv[1:], env_snapshot)
+
+    # Add Codex UUID to metadata if this is a resume
+    if codex_uuid:
+        meta["codex_session_uuid"] = codex_uuid
+        meta["is_resume"] = True
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
     
     print(f"Starting structured Codex session...", file=sys.stderr)
     print(f"Session ID: {session_id}", file=sys.stderr)
+    if codex_uuid:
+        print(f"Codex UUID: {codex_uuid} (resume)", file=sys.stderr)
     print(f"JSONL log: {jsonl_path}", file=sys.stderr)
     print(f"Raw log: {raw_path}", file=sys.stderr)
     print(f"Metadata: {meta_path}", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
-    
+
     # Initialize hash chain
     prev_hash = None
-    
-    # Log session start
-    prev_hash = append_jsonl(jsonl_path, {
+
+    # Build session start record
+    session_start_record = {
         "ts": now_iso(),
         "session_id": session_id,
         "event": "session_started",
         "cmd": meta["cmd"],
         "cwd": meta["cwd"]
-    }, prev_hash)
+    }
+    if codex_uuid:
+        session_start_record["codex_session_uuid"] = codex_uuid
+        session_start_record["is_resume"] = True
+
+    # Log session start
+    prev_hash = append_jsonl(jsonl_path, session_start_record, prev_hash)
+
+    # Build federation event metadata
+    federation_metadata = {
+        "session_id": session_id,
+        "cwd": meta["cwd"],
+        "hostname": meta["hostname"],
+        "codex_version": meta["codex_version"],
+        "jsonl_path": str(jsonl_path),
+    }
+    if codex_uuid:
+        federation_metadata["codex_session_uuid"] = codex_uuid
+        federation_metadata["is_resume"] = True
 
     # Dual-write: Publish to federation events for nabi-tui visibility
+    message = f"Codex session {'resumed' if is_resume else 'started'}: {session_id}"
+    if codex_uuid:
+        message += f" (codex:{codex_uuid[:8]}...)"
+
     publish_federation_event(
         event_type="session_started",
         session_id=session_id,
-        message=f"Codex session started: {session_id}",
-        metadata={
-            "session_id": session_id,
-            "cwd": meta["cwd"],
-            "hostname": meta["hostname"],
-            "codex_version": meta["codex_version"],
-            "jsonl_path": str(jsonl_path),
-        }
+        message=message,
+        metadata=federation_metadata
     )
 
     # Save original terminal settings
@@ -392,8 +452,9 @@ def main():
             exit_code = -1
         
         # Log session end
+        # Build session end record
         end_time = now_iso()
-        prev_hash = append_jsonl(jsonl_path, {
+        session_end_record = {
             "ts": end_time,
             "session_id": session_id,
             "event": "session_ended",
@@ -401,13 +462,17 @@ def main():
             "total_bytes_in": bytes_in,
             "total_bytes_out": bytes_out,
             "duration_estimate": "calculated_by_consumer"
-        }, prev_hash)
-        
+        }
+        if codex_uuid:
+            session_end_record["codex_session_uuid"] = codex_uuid
+
+        prev_hash = append_jsonl(jsonl_path, session_end_record, prev_hash)
+
         # Update metadata
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            
+
             meta.update({
                 "ended_at": end_time,
                 "exit_code": exit_code,
@@ -417,26 +482,35 @@ def main():
                 "jsonl_log_size": jsonl_path.stat().st_size if jsonl_path.exists() else 0,
                 "final_hash": prev_hash
             })
-            
+
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, ensure_ascii=False)
-        
+
         except Exception as e:
             print(f"[codex-tee] Warning: Failed to update metadata: {e}", file=sys.stderr)
-        
+
+        # Build federation event metadata for session_ended
+        end_federation_metadata = {
+            "session_id": session_id,
+            "exit_code": exit_code,
+            "total_bytes_in": bytes_in,
+            "total_bytes_out": bytes_out,
+            "jsonl_path": str(jsonl_path),
+            "final_hash": prev_hash[:16] if prev_hash else None,
+        }
+        if codex_uuid:
+            end_federation_metadata["codex_session_uuid"] = codex_uuid
+
         # Dual-write: Publish session_ended to federation
+        end_message = f"Codex session ended: {session_id} (exit={exit_code}, {bytes_out} bytes)"
+        if codex_uuid:
+            end_message += f" [codex:{codex_uuid[:8]}]"
+
         publish_federation_event(
             event_type="session_ended",
             session_id=session_id,
-            message=f"Codex session ended: {session_id} (exit={exit_code}, {bytes_out} bytes)",
-            metadata={
-                "session_id": session_id,
-                "exit_code": exit_code,
-                "total_bytes_in": bytes_in,
-                "total_bytes_out": bytes_out,
-                "jsonl_path": str(jsonl_path),
-                "final_hash": prev_hash[:16] if prev_hash else None,
-            }
+            message=end_message,
+            metadata=end_federation_metadata
         )
 
         # Optional: Auto-ship to Loki if enabled
