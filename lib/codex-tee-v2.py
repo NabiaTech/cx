@@ -20,7 +20,12 @@ import shutil
 import hashlib
 import signal
 import fcntl
+import subprocess
 from typing import Dict, Any, Optional, Tuple
+
+# Federation dual-write configuration
+FEDERATION_ENABLED = os.environ.get("CX_FEDERATION_EVENTS", "1") == "1"
+LOKI_SHIP_ENABLED = os.environ.get("CX_LOKI_SHIP", "0") == "1"  # Auto-ship on session end
 
 def now_iso() -> str:
     """Generate current timestamp in ISO format with milliseconds"""
@@ -93,6 +98,93 @@ def append_raw(path: pathlib.Path, data: bytes) -> None:
     with open(path, "ab") as f:
         f.write(data)
 
+
+def publish_federation_event(
+    event_type: str,
+    session_id: str,
+    message: str,
+    metadata: Dict[str, Any],
+    severity: str = "info"
+) -> bool:
+    """
+    Publish event to NabiOS federation via nabi events CLI.
+    Dual-write pattern: Local JSONL + Federation Events (NATS + federation JSONL).
+
+    This enables:
+    - nabi-tui visibility (Events Tab)
+    - Cross-session awareness via SCL
+    - Federation-wide observability
+    """
+    if not FEDERATION_ENABLED:
+        return False
+
+    # Check if nabi CLI is available
+    nabi_path = shutil.which("nabi")
+    if nabi_path is None:
+        # Try common locations
+        for path in ["~/.local/share/nabi/bin/nabi", "~/.local/bin/nabi"]:
+            expanded = os.path.expanduser(path)
+            if os.path.exists(expanded):
+                nabi_path = expanded
+                break
+
+    if nabi_path is None:
+        return False
+
+    try:
+        # Add standard metadata
+        metadata.update({
+            "event_type": event_type,
+            "logger": "cx-tee-v2",
+            "state": "ready",  # Makes it visible in nabi-tui "Ready Docs" filter
+        })
+
+        cmd = [
+            nabi_path, "events", "publish",
+            "--source", "codex-session",
+            "--severity", severity,
+            "--message", message,
+            "--metadata", json.dumps(metadata)
+        ]
+
+        # Run async (don't block the PTY loop)
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return True
+    except Exception:
+        return False
+
+
+def ship_to_loki(jsonl_path: pathlib.Path) -> bool:
+    """
+    Ship session JSONL to Loki for Grafana visibility.
+    Runs async after session ends.
+    """
+    if not LOKI_SHIP_ENABLED:
+        return False
+
+    cx_path = shutil.which("cx")
+    if cx_path is None:
+        cx_path = os.path.expanduser("~/.cx/bin/cx")
+
+    if not os.path.exists(cx_path):
+        return False
+
+    try:
+        subprocess.Popen(
+            [cx_path, "ship", str(jsonl_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return True
+    except Exception:
+        return False
+
 def signal_handler(signum, frame):
     """Handle interruption signals gracefully"""
     print(f"\n[codex-tee] Received signal {signum}, exiting gracefully...", file=sys.stderr)
@@ -159,7 +251,21 @@ def main():
         "cmd": meta["cmd"],
         "cwd": meta["cwd"]
     }, prev_hash)
-    
+
+    # Dual-write: Publish to federation events for nabi-tui visibility
+    publish_federation_event(
+        event_type="session_started",
+        session_id=session_id,
+        message=f"Codex session started: {session_id}",
+        metadata={
+            "session_id": session_id,
+            "cwd": meta["cwd"],
+            "hostname": meta["hostname"],
+            "codex_version": meta["codex_version"],
+            "jsonl_path": str(jsonl_path),
+        }
+    )
+
     # Save original terminal settings
     stdin_fd = sys.stdin.fileno()
     old_tty_settings = None
@@ -318,6 +424,25 @@ def main():
         except Exception as e:
             print(f"[codex-tee] Warning: Failed to update metadata: {e}", file=sys.stderr)
         
+        # Dual-write: Publish session_ended to federation
+        publish_federation_event(
+            event_type="session_ended",
+            session_id=session_id,
+            message=f"Codex session ended: {session_id} (exit={exit_code}, {bytes_out} bytes)",
+            metadata={
+                "session_id": session_id,
+                "exit_code": exit_code,
+                "total_bytes_in": bytes_in,
+                "total_bytes_out": bytes_out,
+                "jsonl_path": str(jsonl_path),
+                "final_hash": prev_hash[:16] if prev_hash else None,
+            }
+        )
+
+        # Optional: Auto-ship to Loki if enabled
+        if LOKI_SHIP_ENABLED:
+            ship_to_loki(jsonl_path)
+
         # Print final summary
         print("\n" + "=" * 60, file=sys.stderr)
         print(f"[codex-tee] Session completed:", file=sys.stderr)
@@ -329,6 +454,8 @@ def main():
         print(f"  JSONL log: {jsonl_path} ({jsonl_path.stat().st_size if jsonl_path.exists() else 0} bytes)", file=sys.stderr)
         print(f"  Metadata: {meta_path}", file=sys.stderr)
         print(f"  Chain hash: {prev_hash[:16]}...", file=sys.stderr)
+        if FEDERATION_ENABLED:
+            print(f"  Federation: events published ✓", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

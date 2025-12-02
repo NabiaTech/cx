@@ -130,6 +130,7 @@ cmd_resume() {
     local resume_args=()
     local codex_args=()
     local use_last=false
+    local session_id=""
 
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -146,7 +147,10 @@ cmd_resume() {
                 shift 2
                 ;;
             --help|-h)
-                echo "Usage: cx resume [options]"
+                echo "Usage: cx resume [session-id] [options]"
+                echo ""
+                echo "Arguments:"
+                echo "  session-id  Optional session ID to resume directly"
                 echo ""
                 echo "Options:"
                 echo "  --last    Resume the most recent session"
@@ -154,19 +158,33 @@ cmd_resume() {
                 echo "  -m MODEL  Specify model for resumed session"
                 exit 0
                 ;;
-            *)
+            -*)
+                # Unknown flag - pass to codex
                 codex_args+=("$1")
+                shift
+                ;;
+            *)
+                # Positional arg - treat as session ID
+                if [[ -z "$session_id" ]]; then
+                    session_id="$1"
+                else
+                    codex_args+=("$1")
+                fi
                 shift
                 ;;
         esac
     done
 
+    # Build resume args
     if $use_last; then
         resume_args+=("--last")
+    elif [[ -n "$session_id" ]]; then
+        resume_args+=("$session_id")
     fi
 
     # Run codex resume through tee logger for continued logging
-    cmd_tee resume "${resume_args[@]}" "${codex_args[@]}"
+    # Use ${arr[@]+"${arr[@]}"} pattern to handle empty arrays with set -u
+    cmd_tee resume ${resume_args[@]+"${resume_args[@]}"} ${codex_args[@]+"${codex_args[@]}"}
 }
 
 cmd_headless() {
