@@ -3,6 +3,8 @@
 Codex Loki Shipper - Stream JSONL logs to Loki for federation monitoring
 Usage: codex-loki-shipper.py [options] <jsonl-file>
 Integrates with existing federation Loki infrastructure
+
+Configuration via XDG-compliant TOML: ~/.config/nabi/cx/config.toml
 """
 
 import os
@@ -15,26 +17,9 @@ import argparse
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
-def get_loki_config() -> Dict[str, Any]:
-    """Get Loki configuration from environment and federation settings"""
-    config = {
-        "loki_url": os.environ.get("LOKI_URL", "http://localhost:3100"),
-        "job_name": "codex-sessions",
-        "instance": os.environ.get("HOSTNAME", "unknown"),
-        "federation_node": os.environ.get("FEDERATION_NODE_ID", f"codex-{os.uname().nodename}"),
-    }
-    
-    # Try to load federation-specific config if available
-    federation_config = pathlib.Path.home() / ".memchain" / "loki.json"
-    if federation_config.exists():
-        try:
-            with open(federation_config) as f:
-                fed_config = json.load(f)
-                config.update(fed_config.get("codex", {}))
-        except Exception as e:
-            print(f"Warning: Could not load federation config: {e}", file=sys.stderr)
-    
-    return config
+# Import cx_config from same directory
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from cx_config import get_loki_config
 
 def parse_jsonl_line(line: str) -> Optional[Dict[str, Any]]:
     """Parse a JSONL line safely"""

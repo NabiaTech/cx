@@ -3,6 +3,8 @@
 Codex Tail Shipper - Continuously follow JSONL logs and ship new events
 Defaults to ~/.codexlogs, polls for changes, and posts to a generic HTTP endpoint.
 Uses stdlib only (urllib), persists per-file offsets to resume across restarts.
+
+Configuration via XDG-compliant TOML: ~/.config/nabi/cx/config.toml
 """
 
 import os
@@ -14,7 +16,16 @@ import argparse
 from typing import Dict, Any, List, Optional
 from urllib import request, error
 
-STATE_FILE = pathlib.Path.home() / ".codexlogs" / ".tail_shipper_state.json"
+# Import cx_config from same directory
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from cx_config import load_config
+
+# Load configuration at module level
+_config = load_config()
+
+# State file location derived from config
+_base_dir = pathlib.Path(_config["logging"]["base_dir"]).expanduser()
+STATE_FILE = _base_dir / ".tail_shipper_state.json"
 
 
 def to_generic_event(record: Dict[str, Any], include_text: bool = False) -> Dict[str, Any]:
@@ -102,12 +113,22 @@ def tail_file(path: pathlib.Path, offset: int) -> (int, List[Dict[str, Any]]):
 
 
 def main():
+    # Get defaults from config
+    tail_config = _config["tail_shipper"]
+    gateway_config = _config["gateway"]
+    default_endpoint = f"http://{gateway_config['host']}:{gateway_config['port']}{gateway_config['endpoint']}"
+
     parser = argparse.ArgumentParser(description="Tail Codex JSONL logs and ship to a generic endpoint")
-    parser.add_argument("--endpoint", required=True, help="HTTP endpoint to POST events (e.g., http://localhost:8080/ingest)")
-    parser.add_argument("--base", default=str(pathlib.Path.home() / ".codexlogs"), help="Logs base dir (default ~/.codexlogs)")
-    parser.add_argument("--interval", type=float, default=2.0, help="Poll interval seconds (default 2.0)")
-    parser.add_argument("--batch-size", type=int, default=200, help="Batch size per POST (default 200)")
-    parser.add_argument("--include-text", action="store_true", help="Include raw text content (default false)")
+    parser.add_argument("--endpoint", default=default_endpoint,
+                        help=f"HTTP endpoint to POST events (default from config: {default_endpoint})")
+    parser.add_argument("--base", default=_config["logging"]["base_dir"],
+                        help=f"Logs base dir (default from config: {_config['logging']['base_dir']})")
+    parser.add_argument("--interval", type=float, default=tail_config["poll_interval_seconds"],
+                        help=f"Poll interval seconds (default from config: {tail_config['poll_interval_seconds']})")
+    parser.add_argument("--batch-size", type=int, default=tail_config["batch_size"],
+                        help=f"Batch size per POST (default from config: {tail_config['batch_size']})")
+    parser.add_argument("--include-text", action="store_true", default=tail_config["include_text"],
+                        help=f"Include raw text content (default from config: {tail_config['include_text']})")
     parser.add_argument("--from-beginning", action="store_true", help="Start at beginning (default: tail from end)")
 
     args = parser.parse_args()
